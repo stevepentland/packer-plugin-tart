@@ -5,8 +5,8 @@ package tart
 import (
 	"context"
 	"errors"
-	"time"
 	"fmt"
+	"time"
 
 	"github.com/hashicorp/hcl/v2/hcldec"
 	"github.com/hashicorp/packer-plugin-sdk/bootcommand"
@@ -34,16 +34,17 @@ type Config struct {
 	AllowInsecure   bool     `mapstructure:"allow_insecure"`
 	PullConcurrency uint16   `mapstructure:"pull_concurrency"`
 
-	CpuCount        uint8         `mapstructure:"cpu_count"`
-	CreateGraceTime time.Duration `mapstructure:"create_grace_time"`
-	DiskSizeGb      uint16        `mapstructure:"disk_size_gb"`
-	Display         string        `mapstructure:"display"`
-	Headless        bool          `mapstructure:"headless"`
-	MemoryGb        uint16        `mapstructure:"memory_gb"`
-	Recovery        bool          `mapstructure:"recovery"`
-	Rosetta         string        `mapstructure:"rosetta"`
-	RunExtraArgs    []string      `mapstructure:"run_extra_args"`
-	IpExtraArgs     []string      `mapstructure:"ip_extra_args"`
+	CpuCount          uint8         `mapstructure:"cpu_count"`
+	CreateGraceTime   time.Duration `mapstructure:"create_grace_time"`
+	DiskSizeGb        uint16        `mapstructure:"disk_size_gb"`
+	RecoveryPartition string        `mapstructure:"recovery_partition"`
+	Display           string        `mapstructure:"display"`
+	Headless          bool          `mapstructure:"headless"`
+	MemoryGb          uint16        `mapstructure:"memory_gb"`
+	Recovery          bool          `mapstructure:"recovery"`
+	Rosetta           string        `mapstructure:"rosetta"`
+	RunExtraArgs      []string      `mapstructure:"run_extra_args"`
+	IpExtraArgs       []string      `mapstructure:"ip_extra_args"`
 
 	ctx interpolate.Context
 }
@@ -70,7 +71,7 @@ func (b *Builder) Prepare(raws ...interface{}) (generatedVars []string, warnings
 		return nil, nil, err
 	}
 
-	fromArgs := []bool {
+	fromArgs := []bool{
 		b.config.FromIPSW != "",
 		len(b.config.FromISO) > 0,
 		b.config.VMBaseName != "",
@@ -110,10 +111,8 @@ func (b *Builder) Run(ctx context.Context, ui packer.Ui, hook packer.Hook) (pack
 		return nil, errors.New("\"vm_name\" is required")
 	}
 
-	if b.config.FromIPSW != "" {
+	if b.config.FromIPSW != "" || len(b.config.FromISO) > 0 {
 		steps = append(steps, new(stepCreateVM))
-	} else if len(b.config.FromISO) > 0 {
-		steps = append(steps, new(stepCreateLinuxVM))
 	} else if b.config.VMBaseName != "" {
 		steps = append(steps, new(stepCloneVM))
 	}
