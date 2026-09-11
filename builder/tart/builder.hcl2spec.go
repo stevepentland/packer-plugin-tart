@@ -29,6 +29,7 @@ type FlatConfig struct {
 	HTTPPortMax               *int              `mapstructure:"http_port_max" cty:"http_port_max" hcl:"http_port_max"`
 	HTTPAddress               *string           `mapstructure:"http_bind_address" cty:"http_bind_address" hcl:"http_bind_address"`
 	HTTPInterface             *string           `mapstructure:"http_interface" undocumented:"true" cty:"http_interface" hcl:"http_interface"`
+	HTTPNetworkProtocol       *string           `mapstructure:"http_network_protocol" cty:"http_network_protocol" hcl:"http_network_protocol"`
 	Type                      *string           `mapstructure:"communicator" cty:"communicator" hcl:"communicator"`
 	PauseBeforeConnect        *string           `mapstructure:"pause_before_connecting" cty:"pause_before_connecting" hcl:"pause_before_connecting"`
 	SSHHost                   *string           `mapstructure:"ssh_host" cty:"ssh_host" hcl:"ssh_host"`
@@ -83,10 +84,13 @@ type FlatConfig struct {
 	VMBaseName                *string           `mapstructure:"vm_base_name" cty:"vm_base_name" hcl:"vm_base_name"`
 	VMName                    *string           `mapstructure:"vm_name" cty:"vm_name" hcl:"vm_name"`
 	AllowInsecure             *bool             `mapstructure:"allow_insecure" cty:"allow_insecure" hcl:"allow_insecure"`
+	AlwaysPull                *bool             `mapstructure:"always_pull" cty:"always_pull" hcl:"always_pull"`
 	PullConcurrency           *uint16           `mapstructure:"pull_concurrency" cty:"pull_concurrency" hcl:"pull_concurrency"`
 	CpuCount                  *uint8            `mapstructure:"cpu_count" cty:"cpu_count" hcl:"cpu_count"`
 	CreateGraceTime           *string           `mapstructure:"create_grace_time" cty:"create_grace_time" hcl:"create_grace_time"`
 	DiskSizeGb                *uint16           `mapstructure:"disk_size_gb" cty:"disk_size_gb" hcl:"disk_size_gb"`
+	DiskFormat                *string           `mapstructure:"disk_format" cty:"disk_format" hcl:"disk_format"`
+	RecoveryPartition         *string           `mapstructure:"recovery_partition" cty:"recovery_partition" hcl:"recovery_partition"`
 	Display                   *string           `mapstructure:"display" cty:"display" hcl:"display"`
 	Headless                  *bool             `mapstructure:"headless" cty:"headless" hcl:"headless"`
 	MemoryGb                  *uint16           `mapstructure:"memory_gb" cty:"memory_gb" hcl:"memory_gb"`
@@ -127,6 +131,7 @@ func (*FlatConfig) HCL2Spec() map[string]hcldec.Spec {
 		"http_port_max":                &hcldec.AttrSpec{Name: "http_port_max", Type: cty.Number, Required: false},
 		"http_bind_address":            &hcldec.AttrSpec{Name: "http_bind_address", Type: cty.String, Required: false},
 		"http_interface":               &hcldec.AttrSpec{Name: "http_interface", Type: cty.String, Required: false},
+		"http_network_protocol":        &hcldec.AttrSpec{Name: "http_network_protocol", Type: cty.String, Required: false},
 		"communicator":                 &hcldec.AttrSpec{Name: "communicator", Type: cty.String, Required: false},
 		"pause_before_connecting":      &hcldec.AttrSpec{Name: "pause_before_connecting", Type: cty.String, Required: false},
 		"ssh_host":                     &hcldec.AttrSpec{Name: "ssh_host", Type: cty.String, Required: false},
@@ -181,10 +186,13 @@ func (*FlatConfig) HCL2Spec() map[string]hcldec.Spec {
 		"vm_base_name":                 &hcldec.AttrSpec{Name: "vm_base_name", Type: cty.String, Required: false},
 		"vm_name":                      &hcldec.AttrSpec{Name: "vm_name", Type: cty.String, Required: false},
 		"allow_insecure":               &hcldec.AttrSpec{Name: "allow_insecure", Type: cty.Bool, Required: false},
+		"always_pull":                  &hcldec.AttrSpec{Name: "always_pull", Type: cty.Bool, Required: false},
 		"pull_concurrency":             &hcldec.AttrSpec{Name: "pull_concurrency", Type: cty.Number, Required: false},
 		"cpu_count":                    &hcldec.AttrSpec{Name: "cpu_count", Type: cty.Number, Required: false},
 		"create_grace_time":            &hcldec.AttrSpec{Name: "create_grace_time", Type: cty.String, Required: false},
 		"disk_size_gb":                 &hcldec.AttrSpec{Name: "disk_size_gb", Type: cty.Number, Required: false},
+		"disk_format":                  &hcldec.AttrSpec{Name: "disk_format", Type: cty.String, Required: false},
+		"recovery_partition":           &hcldec.AttrSpec{Name: "recovery_partition", Type: cty.String, Required: false},
 		"display":                      &hcldec.AttrSpec{Name: "display", Type: cty.String, Required: false},
 		"headless":                     &hcldec.AttrSpec{Name: "headless", Type: cty.Bool, Required: false},
 		"memory_gb":                    &hcldec.AttrSpec{Name: "memory_gb", Type: cty.Number, Required: false},

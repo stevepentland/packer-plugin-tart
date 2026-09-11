@@ -5,8 +5,8 @@ package tart
 import (
 	"context"
 	"errors"
-	"time"
 	"fmt"
+	"time"
 
 	"github.com/hashicorp/hcl/v2/hcldec"
 	"github.com/hashicorp/packer-plugin-sdk/bootcommand"
@@ -32,18 +32,21 @@ type Config struct {
 	VMBaseName      string   `mapstructure:"vm_base_name"`
 	VMName          string   `mapstructure:"vm_name"`
 	AllowInsecure   bool     `mapstructure:"allow_insecure"`
+	AlwaysPull      bool     `mapstructure:"always_pull"`
 	PullConcurrency uint16   `mapstructure:"pull_concurrency"`
 
-	CpuCount        uint8         `mapstructure:"cpu_count"`
-	CreateGraceTime time.Duration `mapstructure:"create_grace_time"`
-	DiskSizeGb      uint16        `mapstructure:"disk_size_gb"`
-	Display         string        `mapstructure:"display"`
-	Headless        bool          `mapstructure:"headless"`
-	MemoryGb        uint16        `mapstructure:"memory_gb"`
-	Recovery        bool          `mapstructure:"recovery"`
-	Rosetta         string        `mapstructure:"rosetta"`
-	RunExtraArgs    []string      `mapstructure:"run_extra_args"`
-	IpExtraArgs     []string      `mapstructure:"ip_extra_args"`
+	CpuCount          uint8         `mapstructure:"cpu_count"`
+	CreateGraceTime   time.Duration `mapstructure:"create_grace_time"`
+	DiskSizeGb        uint16        `mapstructure:"disk_size_gb"`
+	DiskFormat        string        `mapstructure:"disk_format"`
+	RecoveryPartition string        `mapstructure:"recovery_partition"`
+	Display           string        `mapstructure:"display"`
+	Headless          bool          `mapstructure:"headless"`
+	MemoryGb          uint16        `mapstructure:"memory_gb"`
+	Recovery          bool          `mapstructure:"recovery"`
+	Rosetta           string        `mapstructure:"rosetta"`
+	RunExtraArgs      []string      `mapstructure:"run_extra_args"`
+	IpExtraArgs       []string      `mapstructure:"ip_extra_args"`
 
 	ctx interpolate.Context
 }
@@ -70,7 +73,7 @@ func (b *Builder) Prepare(raws ...interface{}) (generatedVars []string, warnings
 		return nil, nil, err
 	}
 
-	fromArgs := []bool {
+	fromArgs := []bool{
 		b.config.FromIPSW != "",
 		len(b.config.FromISO) > 0,
 		b.config.VMBaseName != "",
@@ -86,6 +89,22 @@ func (b *Builder) Prepare(raws ...interface{}) (generatedVars []string, warnings
 		}
 	}
 
+	// Set default disk format if not specified
+	if b.config.DiskFormat == "" {
+		b.config.DiskFormat = "raw"
+	}
+
+	// Validate disk format
+	if b.config.DiskFormat != "raw" && b.config.DiskFormat != "asif" {
+		return nil, nil, fmt.Errorf("disk_format must be either 'raw' or 'asif', got '%s'", b.config.DiskFormat)
+	}
+
+	if b.config.DiskFormat == "asif" && b.config.RecoveryPartition != "keep" {
+		return nil, nil, fmt.Errorf("please set the \"recovery_partition\" " +
+			"to \"keep\", as \"delete\" (the default) and \"relocate\" are not supported " +
+			"for ASIF disks")
+	}
+
 	if errs := b.config.CommunicatorConfig.Prepare(&b.config.ctx); len(errs) != 0 {
 		return nil, nil, packer.MultiErrorAppend(nil, errs...)
 	}
@@ -94,6 +113,17 @@ func (b *Builder) Prepare(raws ...interface{}) (generatedVars []string, warnings
 }
 
 func (b *Builder) Run(ctx context.Context, ui packer.Ui, hook packer.Hook) (packer.Artifact, error) {
+	// Set up cancelable build context
+	ctx, cancelBuild := context.WithCancel(ctx)
+
+	// Setup the state bag and initial state for the steps
+	state := new(multistep.BasicStateBag)
+	state.Put("config", &b.config)
+	state.Put("debug", b.config.PackerDebug)
+	state.Put("hook", hook)
+	state.Put("ui", ui)
+	state.Put("cancel-build", cancelBuild)
+
 	steps := []multistep.Step{
 		new(stepCleanVM), // cleanup the VM if the build is cancelled or halted
 	}
@@ -110,10 +140,8 @@ func (b *Builder) Run(ctx context.Context, ui packer.Ui, hook packer.Hook) (pack
 		return nil, errors.New("\"vm_name\" is required")
 	}
 
-	if b.config.FromIPSW != "" {
+	if b.config.FromIPSW != "" || len(b.config.FromISO) > 0 {
 		steps = append(steps, new(stepCreateVM))
-	} else if len(b.config.FromISO) > 0 {
-		steps = append(steps, new(stepCreateLinuxVM))
 	} else if b.config.VMBaseName != "" {
 		steps = append(steps, new(stepCloneVM))
 	}
@@ -128,8 +156,12 @@ func (b *Builder) Run(ctx context.Context, ui packer.Ui, hook packer.Hook) (pack
 		steps = append(steps, new(stepRun))
 	}
 
-	if !b.config.Recovery && communicatorConfigured {
+	if communicatorConfigured {
 		steps = append(steps,
+			&communicator.StepSSHKeyGen{
+				CommConf:            &b.config.CommunicatorConfig,
+				SSHTemporaryKeyPair: b.config.CommunicatorConfig.SSH.SSHTemporaryKeyPair,
+			},
 			&communicator.StepConnect{
 				Config: &b.config.CommunicatorConfig,
 				Host: func(state multistep.StateBag) (string, error) {
@@ -141,13 +173,6 @@ func (b *Builder) Run(ctx context.Context, ui packer.Ui, hook packer.Hook) (pack
 			&commonsteps.StepProvision{},
 		)
 	}
-
-	// Setup the state bag and initial state for the steps
-	state := new(multistep.BasicStateBag)
-	state.Put("config", &b.config)
-	state.Put("debug", b.config.PackerDebug)
-	state.Put("hook", hook)
-	state.Put("ui", ui)
 
 	// Run
 	b.runner = commonsteps.NewRunnerWithPauseFn(steps, b.config.PackerConfig, ui, state)

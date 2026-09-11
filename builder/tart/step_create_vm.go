@@ -17,12 +17,21 @@ func (s *stepCreateVM) Run(ctx context.Context, state multistep.StateBag) multis
 
 	ui.Say("Creating virtual machine...")
 
-	createArguments := []string{
-		"create", "--from-ipsw", config.FromIPSW,
+	isLinux := len(config.FromISO) > 0
+
+	createArguments := []string{"create"}
+	if config.FromIPSW != "" {
+		createArguments = append(createArguments, "--from-ipsw", config.FromIPSW)
+	} else if isLinux {
+		createArguments = append(createArguments, "--linux")
 	}
 
 	if config.DiskSizeGb > 0 {
 		createArguments = append(createArguments, "--disk-size", strconv.Itoa(int(config.DiskSizeGb)))
+	}
+
+	if config.DiskFormat != "" && config.DiskFormat != "raw" {
+		createArguments = append(createArguments, "--disk-format", config.DiskFormat)
 	}
 
 	createArguments = append(createArguments, config.VMName)
@@ -32,6 +41,8 @@ func (s *stepCreateVM) Run(ctx context.Context, state multistep.StateBag) multis
 		state.Put("error", err)
 		return multistep.ActionHalt
 	}
+
+	state.Put("vm_name", config.VMName)
 
 	if config.CreateGraceTime != 0 {
 		message := fmt.Sprintf("Waiting %v to let the Virtualization.Framework's installation process "+

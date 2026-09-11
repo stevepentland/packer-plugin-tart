@@ -5,17 +5,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"regexp"
+	"strings"
+	"time"
+
 	"github.com/apparentlymart/go-cidr/cidr"
 	"github.com/hashicorp/packer-plugin-sdk/bootcommand"
 	"github.com/hashicorp/packer-plugin-sdk/multistep"
 	packersdk "github.com/hashicorp/packer-plugin-sdk/packer"
 	"github.com/hashicorp/packer-plugin-sdk/template/interpolate"
 	"github.com/mitchellh/go-vnc"
-	"net"
-	"os/exec"
-	"regexp"
-	"strings"
-	"time"
 )
 
 var ErrFailedToDetectHostIP = errors.New("failed to detect host IP")
@@ -49,6 +51,9 @@ func (s *stepRun) Run(ctx context.Context, state multistep.StateBag) multistep.S
 	if config.Rosetta != "" {
 		runArgs = append(runArgs, fmt.Sprintf("--rosetta=%s", config.Rosetta))
 	}
+	for _, iso := range config.FromISO {
+		runArgs = append(runArgs, fmt.Sprintf("--disk=%s:ro", iso))
+	}
 	if len(config.RunExtraArgs) > 0 {
 		runArgs = append(runArgs, config.RunExtraArgs...)
 	}
@@ -73,13 +78,47 @@ func (s *stepRun) Run(ctx context.Context, state multistep.StateBag) multistep.S
 
 	state.Put("tart-cmd", cmd)
 
-	if len(config.BootCommand) > 0 && (len(config.FromISO) == 0) && !config.DisableVNC {
+	ui.Say("Successfully started the virtual machine...")
+
+	// Handle VM termination during boot commands or provisioning,
+	// in which case we want to cancel the build instead of hanging
+	// around in the packer plugin until timeout.
+	go func() {
+		err := cmd.Wait()
+		cancelBuild, ok := state.Get("cancel-build").(context.CancelFunc)
+		if !ok {
+			return // Don't treat our own cleanup as a failure
+		}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if err != nil {
+				// Termination via e.g. kill -9
+				ui.Error(fmt.Sprintf("VM terminated with error: %s", err))
+				cancelBuild()
+			} else if strings.Contains(stdout.String(), "Stopping VM...") {
+				// User initiated termination by quitting Tart,
+				// for example via Cmd+Q or closing the window.
+				ui.Error("VM terminated by user action")
+				cancelBuild()
+			} else if strings.Contains(stdout.String(), //nolint:staticcheck
+				"guest has stopped the virtual machine") {
+				// Boot commands or provisioning initiated termination,
+				// for example by issuing 'shutdown -t now', or via UI,
+				// and then issued a wait, to let the OS fully shut down
+				// on its own, instead of the packer plugin tearing down
+				// the VM after boot commands were done, in which case
+				// we assume the user knows what they are doing.
+			}
+		}
+	}()
+
+	if len(config.BootCommand) > 0 && !config.DisableVNC {
 		if !typeBootCommandOverVNC(ctx, state, config, ui, stdout) {
 			return multistep.ActionHalt
 		}
 	}
-
-	ui.Say("Successfully started the virtual machine...")
 
 	return multistep.ActionContinue
 }
@@ -97,11 +136,18 @@ func (u uiWriter) Write(p []byte) (n int, err error) {
 func (s *stepRun) Cleanup(state multistep.StateBag) {
 	config := state.Get("config").(*Config)
 	ui := state.Get("ui").(packersdk.Ui)
+	cmd := state.Get("tart-cmd").(*exec.Cmd)
+	if cmd == nil || cmd.ProcessState != nil {
+		return // Nothing to shut down
+	}
+
+	// Avoid cancellation logic when we explicitly
+	// shut down the VM.
+	state.Put("cancel-build", nil)
 
 	communicator := state.Get("communicator")
 	if communicator != nil {
 		ui.Say("Gracefully shutting down the VM...")
-
 		shutdownCmd := packersdk.RemoteCmd{
 			Command: fmt.Sprintf("echo %s | sudo -S -p '' shutdown -h now", config.CommunicatorConfig.Password()),
 		}
@@ -111,14 +157,19 @@ func (s *stepRun) Cleanup(state multistep.StateBag) {
 			ui.Say("Failed to gracefully shutdown VM...")
 			ui.Error(err.Error())
 		}
+	} else {
+		ui.Say("Shutting down the VM...")
+		err := cmd.Process.Signal(os.Interrupt)
+		if err != nil {
+			ui.Say("Failed to shutdown VM...")
+			ui.Error(err.Error())
+		}
 	}
 
-	cmd := state.Get("tart-cmd").(*exec.Cmd)
-
-	if cmd != nil {
-		ui.Say("Waiting for the tart process to exit...")
-		_, _ = cmd.Process.Wait()
-	}
+	// Always wait, even if we didn't initiate shutdown,
+	// so that we properly read and close stdout/stderr.
+	ui.Say("Waiting for the tart process to exit...")
+	_, _ = cmd.Process.Wait()
 }
 
 func typeBootCommandOverVNC(
@@ -128,10 +179,12 @@ func typeBootCommandOverVNC(
 	ui packersdk.Ui,
 	tartRunStdout *bytes.Buffer,
 ) bool {
+	ui.Say("Typing boot commands over VNC...")
+
 	if config.HTTPDir != "" || len(config.HTTPContent) != 0 {
 		ui.Say("Detecting host IP...")
 
-		hostIP, err := detectHostIP(ctx, config)
+		hostIP, err := detectHostIP(ctx, config, ui)
 		if err != nil {
 			err := fmt.Errorf("Failed to detect the host IP address: %v", err)
 			state.Put("error", err)
@@ -152,7 +205,7 @@ func typeBootCommandOverVNC(
 		}
 	}
 
-	ui.Say("Waiting for the VNC server credentials from Tart...")
+	ui.Say("Waiting for VNC server credentials from Tart...")
 
 	vncCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -180,14 +233,13 @@ func typeBootCommandOverVNC(
 	}
 
 	ui.Say("Retrieved VNC credentials, connecting...")
-	ui.Message(fmt.Sprintf(
-		"If you want to view the screen of the VM, connect via VNC with the password \"%s\" to\n"+
-			"vnc://%s:%s", vncPassword, vncHost, vncPort))
+	ui.Sayf("If you want to view the screen of the VM, connect via VNC with the password \"%s\" to\n"+
+		"vnc://%s:%s", vncPassword, vncHost, vncPort)
 
 	dialer := net.Dialer{}
 	netConn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%s", vncHost, vncPort))
 	if err != nil {
-		err := fmt.Errorf("Failed to connect to the Tart's VNC server: %s", err)
+		err := fmt.Errorf("Failed to connect to Tart's VNC server: %s", err)
 		state.Put("error", err)
 		ui.Error(err.Error())
 
@@ -195,13 +247,15 @@ func typeBootCommandOverVNC(
 	}
 	defer netConn.Close()
 
+	serverMessageChannel := make(chan vnc.ServerMessage)
 	vncClient, err := vnc.Client(netConn, &vnc.ClientConfig{
 		Auth: []vnc.ClientAuth{
 			&vnc.PasswordAuth{Password: vncPassword},
 		},
+		ServerMessageCh: serverMessageChannel,
 	})
 	if err != nil {
-		err := fmt.Errorf("Failed to connect to the Tart's VNC server: %s", err)
+		err := fmt.Errorf("Failed to connect to Tart's VNC server: %s", err)
 		state.Put("error", err)
 		ui.Error(err.Error())
 
@@ -209,7 +263,20 @@ func typeBootCommandOverVNC(
 	}
 	defer vncClient.Close()
 
-	ui.Say("Connected to the VNC!")
+	ui.Say("Connected to VNC server!")
+
+	err = vncClient.SetEncodings([]vnc.Encoding{
+		&vnc.RawEncoding{},
+		&DesktopSizePseudoEncoding{},
+	})
+	if err != nil {
+		err := fmt.Errorf("Failed to set VNC encoding: %s", err)
+		state.Put("error", err)
+		ui.Error(err.Error())
+		return false
+	}
+
+	vncDriver := newCustomDriver(vncClient, serverMessageChannel, config, ctx)
 
 	if config.VNCConfig.BootWait > 0 {
 		message := fmt.Sprintf("Waiting %v after the VM has booted...", config.VNCConfig.BootWait)
@@ -217,9 +284,8 @@ func typeBootCommandOverVNC(
 		time.Sleep(config.VNCConfig.BootWait)
 	}
 
-	vncDriver := bootcommand.NewVNCDriver(vncClient, config.BootKeyInterval)
-
-	ui.Say("Typing the commands over VNC...")
+	message := fmt.Sprintf("Typing commands with key interval %v...", vncDriver.KeyInterval())
+	ui.Say(message)
 
 	command, err := interpolate.Render(config.VNCConfig.FlatBootCommand(), &config.ctx)
 	if err != nil {
@@ -229,6 +295,14 @@ func typeBootCommandOverVNC(
 
 		return false
 	}
+
+	stringWaitRegex := regexp.MustCompile(`<wait\s*'(.+?)'>`)
+	command = stringWaitRegex.ReplaceAllString(command,
+		fmt.Sprintf(`%c${1}%c`, WaitForStringStart, WaitForStringEnd))
+
+	stringClickRegex := regexp.MustCompile(`<click\s*'(.+?)'>`)
+	command = stringClickRegex.ReplaceAllString(command,
+		fmt.Sprintf(`%c${1}%c`, ClickStringStart, ClickStringEnd))
 
 	seq, err := bootcommand.GenerateExpressionSequence(command)
 	if err != nil {
@@ -247,10 +321,12 @@ func typeBootCommandOverVNC(
 		return false
 	}
 
+	ui.Say("Done typing commands!")
+
 	return true
 }
 
-func detectHostIP(ctx context.Context, config *Config) (string, error) {
+func detectHostIP(ctx context.Context, config *Config, ui packersdk.Ui) (string, error) {
 	if config.HTTPAddress != "0.0.0.0" {
 		return config.HTTPAddress, nil
 	}
@@ -262,6 +338,36 @@ func detectHostIP(ctx context.Context, config *Config) (string, error) {
 	}
 	vmIP := net.ParseIP(vmIPRaw)
 
+	// The host-side vmnet bridge whose subnet contains the VM IP may not be up
+	// yet, so retry the interface scan until it appears or we hit the deadline.
+	deadline := time.Now().Add(2 * time.Minute)
+	var lastLog time.Time
+	for {
+		hostIP, err := hostIPForVMIP(vmIP)
+		if err == nil {
+			return hostIP, nil
+		}
+
+		if time.Now().After(deadline) {
+			return "", err
+		}
+
+		if time.Since(lastLog) >= 5*time.Second {
+			ui.Say(fmt.Sprintf("Waiting for the host-side vmnet bridge for "+
+				"VM IP %s to come up...", vmIP))
+			lastLog = time.Now()
+		}
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(time.Second):
+			// retry
+		}
+	}
+}
+
+func hostIPForVMIP(vmIP net.IP) (string, error) {
 	// Find the interface that has this IP
 	interfaces, err := net.Interfaces()
 	if err != nil {

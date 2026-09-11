@@ -1,0 +1,291 @@
+package tart
+
+/*
+#cgo CFLAGS: -x objective-c
+#cgo LDFLAGS: -framework Foundation -framework CoreGraphics -framework Vision
+
+#import <stdlib.h>
+#import "vnc.mm"
+*/
+import "C"
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/hashicorp/packer-plugin-sdk/bootcommand"
+	"github.com/mitchellh/go-vnc"
+
+	"image"
+	"image/color"
+	"image/png"
+
+	"unsafe"
+)
+
+var debugVNC = os.Getenv("PACKER_TART_DEBUG_VNC_FRAMEBUFFER_UPDATES") != ""
+
+type customDriver struct {
+	vncClient            *vnc.ClientConn
+	serverMessageChannel chan vnc.ServerMessage
+	config               *Config
+	vncDriver            bootcommand.BCDriver
+	keyInterval          time.Duration
+	ctx                  context.Context
+	frameBuffer          *image.RGBA
+	waitString           strings.Builder
+	clickString          strings.Builder
+}
+
+func newCustomDriver(vncClient *vnc.ClientConn,
+	serverMessageChannel chan vnc.ServerMessage,
+	config *Config,
+	ctx context.Context) *customDriver {
+
+	// Resolve key interval manually so we can accurately report it back
+	keyInterval := bootcommand.PackerKeyDefault
+	if delay, err := time.ParseDuration(os.Getenv(bootcommand.PackerKeyEnv)); err == nil {
+		keyInterval = delay
+	}
+	if config.BootKeyInterval > time.Duration(0) {
+		keyInterval = config.BootKeyInterval
+	}
+
+	w, h := int(vncClient.FrameBufferWidth), int(vncClient.FrameBufferHeight)
+
+	d := &customDriver{
+		vncClient:            vncClient,
+		serverMessageChannel: serverMessageChannel,
+		config:               config,
+		vncDriver:            bootcommand.NewVNCDriver(vncClient, keyInterval),
+		keyInterval:          keyInterval,
+		ctx:                  ctx,
+		frameBuffer:          image.NewRGBA(image.Rect(0, 0, w, h)),
+	}
+
+	return d
+}
+
+func (d *customDriver) KeyInterval() time.Duration {
+	return d.keyInterval
+}
+
+const (
+	WaitForStringStart rune = 0xE0000
+	WaitForStringEnd   rune = 0xE0001
+
+	ClickStringStart rune = 0xE0002
+	ClickStringEnd   rune = 0xE0003
+)
+
+func (d *customDriver) SendKey(key rune, action bootcommand.KeyAction) error {
+	switch key {
+	case WaitForStringStart:
+		d.waitString.Grow(1)
+	case WaitForStringEnd:
+		waitString := d.waitString.String()
+		d.waitString.Reset()
+
+		for {
+			fmt.Fprintf(os.Stderr, "🔎 Looking for '%s'...\n", waitString)
+			if FindTextCoordinates(d.frameBuffer, waitString) != nil {
+				break
+			}
+
+			if err := d.WaitForFramebufferUpdate(); err != nil {
+				return err
+			}
+		}
+	case ClickStringStart:
+		d.clickString.Grow(1)
+	case ClickStringEnd:
+		clickString := d.clickString.String()
+		d.clickString.Reset()
+
+		var rectangle *image.Rectangle
+
+		for {
+			fmt.Fprintf(os.Stderr, "🔎 Looking for '%s'...\n", clickString)
+
+			rectangle = FindTextCoordinates(d.frameBuffer, clickString)
+			if rectangle != nil {
+				break
+			}
+
+			if err := d.WaitForFramebufferUpdate(); err != nil {
+				return err
+			}
+		}
+
+		centerX := (rectangle.Min.X + rectangle.Max.X) / 2
+		centerY := (rectangle.Min.Y + rectangle.Max.Y) / 2
+
+		fmt.Fprintf(os.Stderr, "🖱️ Clicking at '%s's center (%d, %d) ...\n",
+			clickString, centerX, centerY)
+
+		// Move mouse to position, then press and release to click
+		buttons := []vnc.ButtonMask{0, vnc.ButtonLeft, 0}
+		for i, button := range buttons {
+			if err := d.vncClient.PointerEvent(button, uint16(centerX), uint16(centerY)); err != nil {
+				return err
+			}
+			if i != len(buttons)-1 {
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	default:
+		switch {
+		case d.waitString.Cap() > 0:
+			d.waitString.WriteRune(key)
+			return nil
+		case d.clickString.Cap() > 0:
+			d.clickString.WriteRune(key)
+			return nil
+		default:
+			return d.vncDriver.SendKey(key, action)
+		}
+	}
+
+	return nil
+}
+
+func (d *customDriver) SendSpecial(special string, action bootcommand.KeyAction) error {
+	return d.vncDriver.SendSpecial(special, action)
+}
+
+func (d *customDriver) Flush() error {
+	return d.vncDriver.Flush()
+}
+
+func (d *customDriver) WaitForFramebufferUpdate() error {
+	incremental := true
+
+	for {
+		w, h := d.vncClient.FrameBufferWidth, d.vncClient.FrameBufferHeight
+		fmt.Fprintf(os.Stderr, "📡 Requesting %s frame buffer update for %dx%d\n",
+			map[bool]string{true: "incremental", false: "full"}[incremental], w, h)
+
+		if err := d.vncClient.FramebufferUpdateRequest(incremental, 0, 0, w, h); err != nil {
+			return err
+		}
+
+		select {
+		case msg := <-d.serverMessageChannel:
+			if framebufferUpdateMessage, ok := msg.(*vnc.FramebufferUpdateMessage); ok {
+				if len(framebufferUpdateMessage.Rectangles) == 0 {
+					return fmt.Errorf("⚠️ Frame update did not have any rectangles")
+				}
+				fmt.Fprintf(os.Stderr, "🖼️ New framebuffer update with %d rectangles\n",
+					len(framebufferUpdateMessage.Rectangles))
+
+				for _, rect := range framebufferUpdateMessage.Rectangles {
+					switch encoding := rect.Enc.(type) {
+					case *DesktopSizePseudoEncoding:
+						w, h := int(d.vncClient.FrameBufferWidth), int(d.vncClient.FrameBufferHeight)
+						d.frameBuffer = image.NewRGBA(image.Rect(0, 0, w, h))
+						fmt.Fprintf(os.Stderr, "🖥️ New desktop size is %dx%d, resized framebuffer\n", w, h)
+						continue
+					case *vnc.RawEncoding:
+						for i, c := range encoding.Colors {
+							x, y := i%int(rect.Width), i/int(rect.Width)
+							r, g, b := uint8(c.R), uint8(c.G), uint8(c.B)
+							d.frameBuffer.Set(int(rect.X)+x, int(rect.Y)+y, color.RGBA{r, g, b, 255})
+						}
+					default:
+						return fmt.Errorf("⚠️ Frame had unknown encoding %s", encoding)
+					}
+				}
+
+				if debugVNC {
+					file, err := os.Create("framebuffer.png")
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "⚠️ Failed to create framebuffer file: %v\n", err)
+					} else {
+						if err := png.Encode(file, d.frameBuffer); err != nil {
+							fmt.Fprintf(os.Stderr, "⚠️ Failed to encode framebuffer: %v\n", err)
+						}
+						_ = file.Close()
+					}
+				}
+
+				return nil
+			} else {
+				// Ignore messages we didn't ask for
+				fmt.Fprintln(os.Stderr, "⚠️ Ignoring unknown message type", msg.Type(), msg)
+				continue
+			}
+		case <-time.After(30 * time.Second):
+			fmt.Fprintf(os.Stderr, "⏱️ Framebuffer update timed out after 30s. ")
+			// The built-in VNC server in Virtualization.framework will sometimes
+			// fail to deliver a framebuffer update, even though the VM view shows
+			// new content.
+			if (incremental) {
+				// As a first step, we try a full update, which according to
+				// RFC 6143 7.5.3 should result in the server sending the entire
+				// contents of the specified area as soon as possible.
+				fmt.Fprintf(os.Stderr, "Switching to full update\n")
+				incremental = false
+			} else {
+				// However even full updates may in some cases fail to trigger
+				// an update from the VZ VNC server. As a second step, we move
+				// the mouse, which should result in an update (as long as the
+				// VM shows a local cursor).
+				fmt.Fprintf(os.Stderr, "Moving mouse to trigger update\n")
+				if err := d.vncClient.PointerEvent(0, w-1, 0); err != nil {
+					return err
+				}
+				time.Sleep(1 * time.Second)
+				if err := d.vncClient.PointerEvent(0, 0, 0); err != nil {
+					return err
+				}
+			}
+			continue
+		case <-d.ctx.Done():
+			return d.ctx.Err()
+		}
+	}
+}
+
+type DesktopSizePseudoEncoding struct{}
+
+func (*DesktopSizePseudoEncoding) Read(c *vnc.ClientConn, rect *vnc.Rectangle, r io.Reader) (vnc.Encoding, error) {
+	c.FrameBufferWidth = rect.Width
+	c.FrameBufferHeight = rect.Height
+	return &DesktopSizePseudoEncoding{}, nil
+}
+
+func (*DesktopSizePseudoEncoding) Type() int32 {
+	return -223 // RFC 6143 7.8.2
+}
+
+func FindTextCoordinates(rgba *image.RGBA, s string) *image.Rectangle {
+	sC := C.CString(s)
+	defer C.free(unsafe.Pointer(sC))
+
+	rectangleC := (*C.struct_Rectangle)(C.calloc(1, C.size_t(unsafe.Sizeof(C.struct_Rectangle{}))))
+	defer C.free(unsafe.Pointer(rectangleC))
+
+	ok := C.recognizeTextInFramebuffer(sC, unsafe.Pointer(&rgba.Pix[0]),
+		C.int(rgba.Bounds().Dx()), C.int(rgba.Bounds().Dy()), rectangleC)
+
+	if ok {
+		width, height := float64(rgba.Bounds().Max.X), float64(rgba.Bounds().Max.Y)
+
+		return &image.Rectangle{
+			Min: image.Point{
+				X: int(float64(rectangleC.MinX) * width),
+				Y: int(float64(rectangleC.MinY) * height),
+			},
+			Max: image.Point{
+				X: int(float64(rectangleC.MaxX) * width),
+				Y: int(float64(rectangleC.MaxY) * height),
+			},
+		}
+	}
+
+	return nil
+}

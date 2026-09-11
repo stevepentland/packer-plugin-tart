@@ -1,10 +1,14 @@
+macos_instance:
+  image: ghcr.io/cirruslabs/macos-runner:tahoe
+
 task:
   name: Lint
 
-  container:
-    image: golangci/golangci-lint:latest
+  install_script:
+    - brew install golangci-lint
 
-  script: golangci-lint run -v --timeout 4m0s --out-format json > golangci.json
+  lint_script:
+    - golangci-lint run -v --timeout 4m0s --output.json.path golangci.json
 
   always:
     report_artifacts:
@@ -12,9 +16,19 @@ task:
       format: golangci
 
 task:
+  name: Test
+
+  install_script:
+    - brew install go
+
+  test_script:
+    - go test -v ./...
+
+task:
   name: Build
 
-  container:
-    image: golang:latest
+  install_script:
+    - brew install go
 
-  script: make build
+  build_script:
+    - make build

@@ -3,6 +3,29 @@
 The `Tart` multi-component plugin can be used with HashiCorp [Packer](https://www.packer.io)
 to create custom macOS images. For the full list of available features for this plugin see [docs](https://developer.hashicorp.com/packer/integrations/cirruslabs/tart/latest/components/builder/tart).
 
+> [!IMPORTANT]
+>
+> **macOS 15 (Sequoia) or later**
+>
+> In case you've upgraded and encountering an issue below:
+>
+> ```
+> ssh: connect to host [...] port 22: No route to host
+> ```
+>
+> This is likely related to the [newly introduced "Local Network" permission](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy) on macOS Sequoia and the fact that GitLab Runner's binary might have no `LC_UUID` identifier, which is critical for the local network privacy mechanism.
+>
+> Make sure you're running the [latest version of Packer](https://developer.hashicorp.com/packer/install) first.
+>
+> If the issue persists, try [setting the local network privacy preferences](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy#macOS-considerations) so that all [IPv4 private address space](https://datatracker.ietf.org/doc/html/rfc1918#section-3) that could potentially be used for VMs is excluded:
+>
+> ```shell
+> sudo defaults write com.apple.network.local-network AllowedEthernetLocalNetworkAddresses -array "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16"
+> sudo defaults write com.apple.network.local-network AllowedWiFiLocalNetworkAddresses -array "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16"
+> ```
+>
+> ...and then reboot.
+
 ## Installation
 
 ### Using pre-built releases
@@ -20,7 +43,7 @@ Then, run [`packer init`](https://www.packer.io/docs/commands/init).
 packer {
   required_plugins {
     tart = {
-      version = ">= 0.6.0"
+      version = ">= 1.11.1"
       source  = "github.com/cirruslabs/tart"
     }
   }
